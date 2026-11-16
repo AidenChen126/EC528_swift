@@ -2185,9 +2185,17 @@ class TestRingBuilder(unittest.TestCase):
             self._assert_builder_unchanged(builder_file, good_bytes, expected)
             raise OSError('simulated failure during dump')
 
-        self._check_failed_save_preserves_builder(
-            mock.patch('swift.common.ring.builder.pickle.dump', half_dump),
-            'simulated failure during dump')
+        # Change the builder so a completed save would change the file.
+        rb.version += 1
+        before = set(os.listdir(self.testdir))
+        with mock.patch('swift.common.ring.builder.pickle.dump', half_dump):
+            with self.assertRaises(OSError) as cm:
+                rb.save(builder_file)
+        self.assertEqual('simulated failure during dump', str(cm.exception))
+
+        # The builder file is unchanged and no temp file is left behind.
+        self.assertEqual(before, set(os.listdir(self.testdir)))
+        self._assert_builder_unchanged(builder_file, good_bytes, expected)
 
     def test_save_explicit_flush_failure(self):
         real_tempfile = tempfile.NamedTemporaryFile
@@ -2309,9 +2317,12 @@ class TestRingBuilder(unittest.TestCase):
         self.assertEqual(['test_save.builder'], os.listdir(self.testdir))
         loaded_rb = ring.RingBuilder.load(builder_file)
         self.assertEqual(rb.version, loaded_rb.version)
+        # load() adds replication fields to each device dict, so compare
+        # device ids rather than the dicts themselves.
         for part in range(loaded_rb.parts):
-            self.assertEqual(rb.get_part_devices(part),
-                             loaded_rb.get_part_devices(part))
+            self.assertEqual(
+                [dev['id'] for dev in rb.get_part_devices(part)],
+                [dev['id'] for dev in loaded_rb.get_part_devices(part)])
 
     def test_save_after_stale_temp_file(self):
         # A writer killed before its rename can leave a temporary file
