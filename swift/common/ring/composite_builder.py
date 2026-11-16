@@ -516,10 +516,11 @@ class CompositeRingBuilder(object):
         metadata['saved_path'] = os.path.abspath(path_to_file)
         metadata['serialization_version'] = 1
         try:
-            with NamedTemporaryFile(mode='wt',
-                dir=os.path.dirname(path_to_file),
-                prefix=os.path.basename(path_to_file),
-                delete=False) as fp:
+            with NamedTemporaryFile(
+                    mode='wt',
+                    dir=os.path.dirname(path_to_file),
+                    prefix=os.path.basename(path_to_file),
+                    delete=False) as fp:
                 tempfile_name = fp.name
                 json.dump(metadata, fp)
                 fp.flush()
