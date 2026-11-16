@@ -1,98 +1,13 @@
 #!/usr/bin/env python3
 
-"""Expanded local SAIO scale and integrity suite.
+"""Expanded local SAIO scale/integrity suite. No ring/configuration changes.
 
-Prerequisites:
-    - A running local Swift SAIO deployment.
-    - An active Python environment containing python-swiftclient.
-    - Run from the repository root.
-    - Storage mounted at /mnt/sdb1 for the free-space check.
 
-Authentication:
-    Defaults:
-        ST_AUTH=http://127.0.0.1:8080/auth/v1.0
-        ST_USER=test:tester
-        ST_KEY=testing
 
-    Override these with environment variables if needed.
-    Only the script's allowed localhost authentication URLs are accepted.
+0=PASS, 1=FAIL/incomplete, 77=preflight refused. Real cluster execution required.
 
-Examples:
-    # Show available options:
-    python experiments/saio_scale_tests_expanded.py --help
 
-    # Validate connectivity and basic operations:
-    python experiments/saio_scale_tests_expanded.py --case smoke
 
-    # Run small, medium, large, and mixed profiles:
-    python experiments/saio_scale_tests_expanded.py --case all
-
-    # Run a ten-minute mixed traffic phase:
-    python experiments/saio_scale_tests_expanded.py --case mixed --seconds 600
-
-    # Test 16 objects of 64 MiB each using two workers:
-    python experiments/saio_scale_tests_expanded.py --case large --count 16 --size-mib 64 --workers 2
-
-Results:
-    By default, each run writes to:
-        experiment-results/saio-expanded-<timestamp>-<id>/
-
-    The terminal prints the report directory when the run finishes.
-
-    summary.json contains configuration, results, and aggregate metrics.
-    <case>-requests.csv contains per-operation timings and errors.
-
-    Run the following commands from the repository root.
-    If you used --output, substitute that directory for experiment-results.
-
-    # List saved summary files:
-    find experiment-results -name summary.json -print
-
-    # Pretty-print one summary:
-    # Replace the example path with an actual path from the listing above.
-    python -m json.tool experiment-results/saio-expanded-<timestamp>-<id>/summary.json
-
-    # Print every expanded-suite summary with its filename:
-    for summary in experiment-results/saio-expanded-*/summary.json; do
-        [ -f "$summary" ] || continue
-        printf '\\n========== %s ==========\\n' "$summary"
-        python -m json.tool "$summary"
-    done
-
-    Interpreting summary.json:
-        - Top-level status PASS means all selected cases passed.
-        - cases lists the profiles that actually ran.
-        - Each case records its status and workload configuration.
-        - metrics contains operation counts, failures, bytes, and latencies.
-        - successful_latency_seconds uses seconds, not milliseconds.
-        - successful_requests_per_second covers the workload interval,
-          including setup/verification phases within that interval.
-        - cleanup_errors should be an empty list.
-        - An error field, when present, gives a recorded failure reason.
-        - Status RUNNING is not a completed passing result; the process may
-          still be active or may have stopped before finalizing its report.
-
-    The configured --seconds value applies to the mixed traffic phase,
-    not to the entire suite. Seeding, verification, and cleanup add time.
-    It does not impose a duration on the finite workload profiles.
-
-Safety:
-    Creates uniquely named test containers and attempts to remove them.
-    Checks available disk space before each case.
-    Does not modify rings, builders, or Swift configuration.
-    Forced termination may leave test containers behind.
-
-Limitations:
-    Object traffic does not directly exercise ring-builder saves.
-    Single-host results do not establish multi-host production capacity.
-    Recorded checkout metadata does not prove the running server revision.
-
-Exit codes:
-    0: All selected cases passed.
-    1: Failure or incomplete run.
-    77: Dependency or authentication preflight refused.
-
-    Other startup errors may produce different nonzero exit codes.
 """
 
 import argparse
@@ -161,7 +76,9 @@ def main():
 
     ap.add_argument('--case',choices=list(CASES)+['all'],default='smoke')
 
-    ap.add_argument('--seconds',type=int,default=180,help='mixed workload duration')
+    ap.add_argument('--seconds',type=int,default=180,help='mixed or --sustain workload duration')
+
+    ap.add_argument('--sustain',action='store_true',help='use sustained mixed operations with the selected case population/sizes')
 
     ap.add_argument('--workers',type=int)
 
@@ -433,11 +350,19 @@ def main():
 
                     phase(pool,'seed dataset',seed)
 
-                    if case=='mixed':
+                    if case=='mixed' or a.sustain:
 
-                        print('mixed: sustained traffic (%ds)'%a.seconds,flush=True)
+                        print('%s: sustained traffic (%ds)'%(case,a.seconds),flush=True)
 
-                        deadline=time.monotonic()+a.seconds
+                        sustained_start=time.monotonic()
+
+                        deadline=sustained_start+a.seconds
+
+                        entry['sustained_start_monotonic']=sustained_start
+
+                        entry['sustained_seconds']=a.seconds
+
+                        print('ATOMIC_LOAD_READY %.9f'%sustained_start,flush=True)
 
                         entry['worker_iterations']=list(pool.map(mixed_worker,range(workers)))
 
