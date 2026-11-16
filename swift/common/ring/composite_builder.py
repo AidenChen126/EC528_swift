@@ -490,42 +490,47 @@ class CompositeRingBuilder(object):
                 'component_builder_files': id2builder_file,
                 'version': self.version}
 
-    def save(self, builder_file):
-        """Serialize this RingBuilder instance to disk.
-
-        :param builder_file: path to builder file to save
+    def save(self, path_to_file):
         """
-        # We want to be sure the builder id's are persistent, so this is the
-        # only place where the id is assigned. Newly created instances of this
-        # class, or instances loaded from legacy builder files that have no
-        # persisted id, must be saved in order for an id to be assigned.
-        id_persisted = True
-        if self._id is None:
-            id_persisted = False
-            self._id = uuid.uuid4().hex
-        builder_file = os.path.abspath(builder_file)
-        temp_builder_filename = None
+        Save composite ring metadata to given file. See
+        :class:`CompositeRingBuilder` for details of the persisted metadata
+        format.
 
+        :param path_to_file: Absolute path to a composite ring file
+        :raises ValueError: if no composite ring has been built yet with this
+                            instance
+        """
+        if not self.components or not self._builder_files:
+            raise ValueError("No composed ring to save.")
+        path_to_file = os.path.abspath(path_to_file)
+        # persist relative paths to builder files
+        tempfile_name = None
+        metadata = self.to_dict()
+        # future-proofing:
+        # - saving abs path to component builder files and this file should
+        # allow the relative paths to be derived if required when loading
+        # a set of {composite builder file, component builder files} that
+        # has been moved, so long as their relative locations are
+        # unchanged.
+        # - save a serialization format version number
+        metadata['saved_path'] = os.path.abspath(path_to_file)
+        metadata['serialization_version'] = 1
         try:
-            with NamedTemporaryFile(
-                    mode='wb',
-                    dir=os.path.dirname(builder_file) or '.',
-                    prefix=os.path.basename(builder_file),
-                    delete=False) as fh:
-                temp_builder_filename = fh.name
-                pickle.dump(self.to_dict(), fh, protocol=2)
-                fh.flush()
-                os.fsync(fh.fileno())
-            renamer(temp_builder_filename, builder_file, fsync=True)
-            
+            with NamedTemporaryFile(mode='wt',
+                dir=os.path.dirname(path_to_file),
+                prefix=os.path.basename(path_to_file),
+                delete=False) as fp:
+                tempfile_name = fp.name
+                json.dump(metadata, fp)
+                fp.flush()
+                os.fsync(fp.fileno())
+            renamer(tempfile_name, path_to_file, fsync=True)
         except Exception:
-            if temp_builder_filename is not None:
+            if tempfile_name is not None:
                 try:
-                    os.unlink(temp_builder_filename)
+                    os.unlink(tempfile_name)
                 except OSError:
                     pass
-            if not id_persisted:
-                self._id = None
             raise
 
     def _load_components(self, builder_files=None, force=False,

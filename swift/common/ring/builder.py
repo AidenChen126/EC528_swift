@@ -1832,19 +1832,20 @@ class RingBuilder(object):
         if self._id is None:
             id_persisted = False
             self._id = uuid.uuid4().hex
+        builder_file = os.path.abspath(builder_file)
         temp_builder_filename = None
 
         try:
             with NamedTemporaryFile(
                     mode='wb',
-                    dir=os.path.dirname(builder_file) or '.',
+                    dir=os.path.dirname(builder_file),
                     prefix=os.path.basename(builder_file),
                     delete=False) as fh:
                 temp_builder_filename = fh.name
                 pickle.dump(self.to_dict(), fh, protocol=2)
                 fh.flush()
                 os.fsync(fh.fileno())
-
+            renamer(temp_builder_filename, builder_file, fsync=True)
         except Exception:
             if temp_builder_filename is not None:
                 try:
@@ -1854,7 +1855,6 @@ class RingBuilder(object):
             if not id_persisted:
                 self._id = None
             raise
-        renamer(temp_builder_filename, builder_file, fsync=True)
 
     def search_devs(self, search_values):
         """Search devices by parameters.
