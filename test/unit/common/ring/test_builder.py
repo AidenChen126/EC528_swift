@@ -20,6 +20,8 @@ import operator
 import os
 import unittest
 import pickle
+import stat
+import tempfile
 from array import array
 from collections import Counter, defaultdict
 from math import ceil
@@ -44,6 +46,36 @@ def _partition_counts(builder, key='id'):
     return Counter(builder.devs[dev_id][key]
                    for part2dev_id in builder._replica2part2dev
                    for dev_id in part2dev_id)
+
+
+class _ObservedFile(object):
+    """
+    Wrap a file object, recording explicit flush and close calls in events,
+    and optionally failing the explicit flush.
+    """
+
+    def __init__(self, handle, events, flush_error=None):
+        self.handle = handle
+        self.events = events
+        self.flush_error = flush_error
+
+    def __getattr__(self, name):
+        return getattr(self.handle, name)
+
+    def __enter__(self):
+        self.handle.__enter__()
+        return self
+
+    def __exit__(self, *args):
+        result = self.handle.__exit__(*args)
+        self.events.append('close')
+        return result
+
+    def flush(self):
+        if self.flush_error is not None:
+            raise self.flush_error
+        self.handle.flush()
+        self.events.append('flush')
 
 
 class TestRingBuilder(unittest.TestCase):
@@ -2068,8 +2100,7 @@ class TestRingBuilder(unittest.TestCase):
         self.assertEqual(loaded_rb.dev_id_bytes, 2)
         self.assertEqual(loaded_rb._replica2part2dev[0].itemsize, 2)
 
-    def test_save(self):
-        # Setup: similar to test_save_partial_dump_does_nothing.
+    def _make_save_test_builder(self):
         rb = ring.RingBuilder(8, 3, 1)
         devs = [{'id': 0, 'region': 0, 'zone': 0, 'weight': 1,
                  'ip': '127.0.0.0', 'port': 10000, 'device': 'sda1',
@@ -2085,78 +2116,243 @@ class TestRingBuilder(unittest.TestCase):
         for d in devs:
             rb.add_dev(d)
         rb.rebalance()
+        return rb
 
+    def _save_and_snapshot(self, rb, builder_file):
+        # Save the builder and return what an unchanged file must contain.
+        rb.save(builder_file)
+        with open(builder_file, 'rb') as f:
+            good_bytes = f.read()
+        # Compare loaded states to include load-time metadata normalization.
+        expected = ring.RingBuilder.load(builder_file).to_dict()
+        return good_bytes, expected
+
+    def _assert_builder_unchanged(self, builder_file, good_bytes, expected):
+        with open(builder_file, 'rb') as f:
+            self.assertEqual(good_bytes, f.read())
+        loaded_rb = ring.RingBuilder.load(builder_file)
+        self.assertEqual(expected, loaded_rb.to_dict())
+
+    def _check_failed_save_preserves_builder(self, patcher, message):
+        rb = self._make_save_test_builder()
+        builder_file = os.path.join(self.testdir, 'test_save.builder')
+        good_bytes, expected = self._save_and_snapshot(rb, builder_file)
+        # Change the builder so a completed save would change the file.
+        rb.version += 1
+        before = set(os.listdir(self.testdir))
+        with patcher:
+            with self.assertRaises(OSError) as cm:
+                rb.save(builder_file)
+        # The injected error, not some other OSError, reached the caller.
+        self.assertEqual(message, str(cm.exception))
+        # The old builder survives and no temporary file is left behind.
+        self.assertEqual(before, set(os.listdir(self.testdir)))
+        self._assert_builder_unchanged(builder_file, good_bytes, expected)
+
+    def test_save(self):
+        rb = self._make_save_test_builder()
         builder_file = os.path.join(self.testdir, 'test_save.builder')
 
-        temp_builder_file = builder_file + ".new.%d" % os.getpid() # TODO: Change this line after we improve builder.save()
-
-        # A successful first save should create a loadable builder.
+        # A successful first save should create a loadable builder and
+        # leave no temporary file behind.
         rb.save(builder_file)
         self.assertTrue(os.path.isfile(builder_file))
+        self.assertEqual(['test_save.builder'], os.listdir(self.testdir))
 
-        # Varify that save() does not leave temp files over.
-        self.assertFalse(os.path.exists(temp_builder_file))
-
-        # Compare loaded states so load-time metadata normalization is included.
+        # Compare loaded states to include load-time metadata normalization.
         expected = ring.RingBuilder.load(builder_file).to_dict()
 
         # Saving again should preserve the builder's saved state.
         rb.save(builder_file)
-
-        # Varify that save() does not leave temp files over.
-        self.assertFalse(os.path.exists(temp_builder_file))
+        self.assertEqual(['test_save.builder'], os.listdir(self.testdir))
 
         actual = ring.RingBuilder.load(builder_file).to_dict()
         self.assertEqual(expected, actual)
 
     def test_save_partial_dump_does_nothing(self):
-        # Setup: similiar to test_save.
-        rb = ring.RingBuilder(8, 3, 1)
-        devs = [{'id': 0, 'region': 0, 'zone': 0, 'weight': 1,
-                 'ip': '127.0.0.0', 'port': 10000, 'device': 'sda1',
-                 'meta': 'meta0'},
-                {'id': 1, 'region': 0, 'zone': 1, 'weight': 1,
-                 'ip': '127.0.0.1', 'port': 10001, 'device': 'sdb1',
-                 'meta': 'meta1'},
-                {'id': 2, 'region': 0, 'zone': 2, 'weight': 2,
-                 'ip': '127.0.0.2', 'port': 10002, 'device': 'sdc1',
-                 'meta': 'meta2'},
-                {'id': 3, 'region': 0, 'zone': 3, 'weight': 2,
-                 'ip': '127.0.0.3', 'port': 10003, 'device': 'sdd1'}]
-        for d in devs:
-            rb.add_dev(d)
-        rb.rebalance()
-
+        rb = self._make_save_test_builder()
         builder_file = os.path.join(self.testdir, 'test_save.builder')
+        good_bytes, expected = self._save_and_snapshot(rb, builder_file)
 
-        # Save builder before any change for assertEqual comparison.
-        rb.save(builder_file)
-        with open(builder_file, 'rb') as f:
-            good_bytes = f.read()
-
-        # Compare loaded states so load-time metadata normalization is included.
-        expected = ring.RingBuilder.load(builder_file).to_dict()
-
-        def half_dump(obj, file, protocol=None, **kwargs):
+        def half_dump(obj, fh, protocol=None, **kwargs):
             # Simulate a crash part-way through writing the pickle stream:
+            # write only half the bytes, then fail.
             payload = pickle.dumps(obj, protocol=protocol or 2)
-            file.write(payload[:len(payload) // 2]) # write only half the bytes
-            file.flush()
+            fh.write(payload[:len(payload) // 2])
+            fh.flush()
+            # A process killed at this point would leave the live builder
+            # exactly as it is now.
+            self._assert_builder_unchanged(builder_file, good_bytes, expected)
             raise OSError('simulated failure during dump')
 
-        temp_builder_file = builder_file + ".new.%d" % os.getpid() # TODO: Change this line after we improve builder.save()
+        self._check_failed_save_preserves_builder(
+            mock.patch('swift.common.ring.builder.pickle.dump', half_dump),
+            'simulated failure during dump')
 
-        with mock.patch('swift.common.ring.builder.pickle.dump', half_dump):
-            self.assertRaises(OSError, rb.save, builder_file)
+    def test_save_explicit_flush_failure(self):
+        real_tempfile = tempfile.NamedTemporaryFile
 
-        # Varification: the builder file should be unchanged after the failed save, 
-        # no temporary file should be left behind.
-        with open(builder_file, 'rb') as f:
-            self.assertEqual(good_bytes, f.read())
-        self.assertFalse(os.path.exists(temp_builder_file))
+        def failing_flush_tempfile(*args, **kwargs):
+            return _ObservedFile(real_tempfile(*args, **kwargs), [],
+                                 flush_error=OSError('injected flush failure'))
 
+        self._check_failed_save_preserves_builder(
+            mock.patch('swift.common.ring.builder.NamedTemporaryFile',
+                       failing_flush_tempfile),
+            'injected flush failure')
+
+    def test_save_fsync_failure(self):
+        self._check_failed_save_preserves_builder(
+            mock.patch('os.fsync',
+                       side_effect=OSError('injected fsync failure')),
+            'injected fsync failure')
+
+    def test_save_rename_failure(self):
+        # renamer() retries os.rename once; both attempts fail here.
+        self._check_failed_save_preserves_builder(
+            mock.patch('os.rename',
+                       side_effect=OSError('injected rename failure')),
+            'injected rename failure')
+
+    def test_save_failed_first_save_resets_id(self):
+        rb = self._make_save_test_builder()
+        self.assertIsNone(rb._id)
+        builder_file = os.path.join(self.testdir, 'test_save.builder')
+        with mock.patch('swift.common.ring.builder.pickle.dump',
+                        side_effect=OSError('injected first-save failure')):
+            with self.assertRaises(OSError) as cm:
+                rb.save(builder_file)
+        self.assertEqual('injected first-save failure', str(cm.exception))
+        # The id assigned for this save was never persisted, so it is reset,
+        # and neither the builder nor a temporary file exists.
+        self.assertIsNone(rb._id)
+        self.assertEqual([], os.listdir(self.testdir))
+
+    def test_save_cleanup_failure_keeps_original_error(self):
+        rb = self._make_save_test_builder()
+        builder_file = os.path.join(self.testdir, 'test_save.builder')
+        good_bytes, expected = self._save_and_snapshot(rb, builder_file)
+        rb.version += 1
+        unlinked = []
+
+        def failing_unlink(path, *args, **kwargs):
+            unlinked.append(path)
+            raise OSError('injected unlink failure')
+
+        with mock.patch('os.fsync',
+                        side_effect=OSError('injected fsync failure')), \
+                mock.patch('os.unlink', failing_unlink):
+            with self.assertRaises(OSError) as cm:
+                rb.save(builder_file)
+        self.assertEqual('injected fsync failure', str(cm.exception))
+        self.assertEqual(1, len(unlinked))
+        self._assert_builder_unchanged(builder_file, good_bytes, expected)
+        # Cleanup could not run, so only that attempt's file remains.
+        self.assertEqual(
+            sorted(['test_save.builder', os.path.basename(unlinked[0])]),
+            sorted(os.listdir(self.testdir)))
+
+    def test_save_durability_order(self):
+        rb = self._make_save_test_builder()
+        builder_file = os.path.join(self.testdir, 'test_save.builder')
+        good_bytes, expected = self._save_and_snapshot(rb, builder_file)
+        rb.version += 1
+        events, temp_files = [], []
+        real_tempfile = tempfile.NamedTemporaryFile
+        real_dump, real_fsync, real_rename = pickle.dump, os.fsync, os.rename
+
+        def observed_tempfile(*args, **kwargs):
+            handle = real_tempfile(*args, **kwargs)
+            temp_files.append(os.path.abspath(handle.name))
+            return _ObservedFile(handle, events)
+
+        def observed_dump(obj, fh, *args, **kwargs):
+            # The live builder is untouched while the new one is written.
+            self._assert_builder_unchanged(builder_file, good_bytes, expected)
+            real_dump(obj, fh, *args, **kwargs)
+            events.append('serialize')
+
+        def observed_fsync(fd):
+            is_dir = stat.S_ISDIR(os.fstat(fd).st_mode)
+            if not is_dir:
+                self._assert_builder_unchanged(
+                    builder_file, good_bytes, expected)
+            real_fsync(fd)
+            events.append('directory_fsync' if is_dir else 'file_fsync')
+
+        def observed_rename(old, new):
+            # The temporary file sits beside the builder, is complete, and
+            # the old builder is still intact until the rename.
+            self.assertEqual(temp_files[-1], os.path.abspath(old))
+            self.assertEqual(os.path.abspath(builder_file),
+                             os.path.abspath(new))
+            self.assertEqual(os.path.dirname(os.path.abspath(builder_file)),
+                             os.path.dirname(os.path.abspath(old)))
+            with open(old, 'rb') as f:
+                self.assertEqual(rb.to_dict(), pickle.load(f))
+            self._assert_builder_unchanged(builder_file, good_bytes, expected)
+            real_rename(old, new)
+            events.append('rename')
+
+        with mock.patch('swift.common.ring.builder.NamedTemporaryFile',
+                        observed_tempfile), \
+                mock.patch('swift.common.ring.builder.pickle.dump',
+                           observed_dump), \
+                mock.patch('os.fsync', observed_fsync), \
+                mock.patch('os.rename', observed_rename):
+            rb.save(builder_file)
+
+        self.assertEqual(['serialize', 'flush', 'file_fsync', 'close',
+                          'rename', 'directory_fsync'], events)
+        self.assertEqual(1, len(temp_files))
+        self.assertFalse(os.path.exists(temp_files[0]))
+        self.assertEqual(['test_save.builder'], os.listdir(self.testdir))
         loaded_rb = ring.RingBuilder.load(builder_file)
-        self.assertEqual(expected, loaded_rb.to_dict())
+        self.assertEqual(rb.version, loaded_rb.version)
+        for part in range(loaded_rb.parts):
+            self.assertEqual(rb.get_part_devices(part),
+                             loaded_rb.get_part_devices(part))
+
+    def test_save_after_stale_temp_file(self):
+        # A writer killed before its rename can leave a temporary file
+        # behind; it must not block or be confused with a later save.
+        rb = self._make_save_test_builder()
+        builder_file = os.path.join(self.testdir, 'test_save.builder')
+        rb.save(builder_file)
+        stale_file = builder_file + 'stale'
+        with open(stale_file, 'wb') as f:
+            f.write(b'half-written builder')
+        rb.version += 1
+        rb.save(builder_file)
+        self.assertEqual(rb.version,
+                         ring.RingBuilder.load(builder_file).version)
+        with open(stale_file, 'rb') as f:
+            self.assertEqual(b'half-written builder', f.read())
+        self.assertEqual(
+            sorted(['test_save.builder', 'test_save.builderstale']),
+            sorted(os.listdir(self.testdir)))
+
+    def test_save_relative_path(self):
+        # swift-ring-builder is commonly run from the ring directory with a
+        # bare builder name.
+        rb = self._make_save_test_builder()
+        self.addCleanup(os.chdir, os.getcwd())
+        os.chdir(self.testdir)
+        rb.save('relative.builder')
+        self.assertEqual(['relative.builder'], os.listdir(self.testdir))
+        loaded_rb = ring.RingBuilder.load(
+            os.path.join(self.testdir, 'relative.builder'))
+        self.assertEqual(rb.version, loaded_rb.version)
+
+    def test_save_repeatedly_leaves_no_temp_files(self):
+        rb = self._make_save_test_builder()
+        builder_file = os.path.join(self.testdir, 'test_save.builder')
+        for _ in range(10):
+            rb.version += 1
+            rb.save(builder_file)
+            self.assertEqual(rb.version,
+                             ring.RingBuilder.load(builder_file).version)
+        self.assertEqual(['test_save.builder'], os.listdir(self.testdir))
 
     def test_id(self):
         rb = ring.RingBuilder(8, 3, 1)

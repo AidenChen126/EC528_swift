@@ -18,6 +18,7 @@ from contextlib import contextmanager
 from unittest import mock
 import os
 import random
+import stat
 import tempfile
 import unittest
 import shutil
@@ -28,6 +29,7 @@ from collections import defaultdict, Counter
 
 from swift.common.exceptions import RingBuilderError
 from swift.common.ring import RingBuilder, Ring
+from swift.common.ring import composite_builder
 from swift.common.ring.composite_builder import (
     compose_rings, CompositeRingBuilder, CooperativeRingBuilder)
 
@@ -46,6 +48,36 @@ def make_device_iter():
                'device': 'sda',
                'weight': 100.0, }
         x += 1
+
+
+class _ObservedFile(object):
+    """
+    Wrap a file object, recording explicit flush and close calls in events,
+    and optionally failing the explicit flush.
+    """
+
+    def __init__(self, handle, events, flush_error=None):
+        self.handle = handle
+        self.events = events
+        self.flush_error = flush_error
+
+    def __getattr__(self, name):
+        return getattr(self.handle, name)
+
+    def __enter__(self):
+        self.handle.__enter__()
+        return self
+
+    def __exit__(self, *args):
+        result = self.handle.__exit__(*args)
+        self.events.append('close')
+        return result
+
+    def flush(self):
+        if self.flush_error is not None:
+            raise self.flush_error
+        self.handle.flush()
+        self.events.append('flush')
 
 
 class BaseTestCompositeBuilder(unittest.TestCase):
@@ -562,6 +594,301 @@ class TestCompositeRingBuilder(BaseTestCompositeBuilder):
         do_test(CompositeRingBuilder())
         do_test(CompositeRingBuilder([]))
         do_test(CompositeRingBuilder(['file1', 'file2']))
+
+    def _save_composite(self):
+        # Compose and save a composite, and return what an unchanged
+        # composite file must contain.
+        builders = self.create_sample_ringbuilders(2)
+        cb, _ = self._make_composite_builder(builders)
+        cb_file = os.path.join(self.tmpdir, 'test-composite-ring.json')
+        cb.save(cb_file)
+        with open(cb_file, 'rb') as fd:
+            good_bytes = fd.read()
+        # Compare loaded states on both sides; load() normalizes paths.
+        cb = CompositeRingBuilder.load(cb_file)
+        return cb, cb_file, good_bytes, cb.to_dict()
+
+    def _composed_parts(self, cb_file):
+        # The partition-to-device table the saved composite composes to.
+        ring_data = CompositeRingBuilder.load(cb_file).compose(force=True)
+        return [list(row) for row in ring_data._replica2part2dev_id]
+
+    def _assert_composite_unchanged(self, cb_file, good_bytes, expected,
+                                    parts):
+        with open(cb_file, 'rb') as fd:
+            self.assertEqual(good_bytes, fd.read())
+        self.assertEqual(expected,
+                         CompositeRingBuilder.load(cb_file).to_dict())
+        self.assertEqual(parts, self._composed_parts(cb_file))
+
+    def _check_failed_save_preserves_composite(self, patcher, message):
+        cb, cb_file, good_bytes, expected = self._save_composite()
+        parts = self._composed_parts(cb_file)
+        # Change the composite so a completed save would change the file.
+        cb.version += 1
+        before = set(os.listdir(self.tmpdir))
+        with patcher:
+            with self.assertRaises(OSError) as cm:
+                cb.save(cb_file)
+        # The injected error, not some other OSError, reached the caller.
+        self.assertEqual(message, str(cm.exception))
+        # The old composite survives and no temporary file is left behind.
+        self.assertEqual(before, set(os.listdir(self.tmpdir)))
+        self._assert_composite_unchanged(cb_file, good_bytes, expected,
+                                         parts)
+
+    def test_save_partial_dump_does_nothing(self):
+        cb, cb_file, good_bytes, expected = self._save_composite()
+        parts = self._composed_parts(cb_file)
+
+        def half_dump(obj, fp, **kwargs):
+            # Simulate a crash part-way through writing the metadata:
+            # write only half of it, then fail.
+            payload = json.dumps(obj, **kwargs)
+            fp.write(payload[:len(payload) // 2])
+            fp.flush()
+            # A process killed at this point would leave the live composite
+            # exactly as it is now.
+            self._assert_composite_unchanged(cb_file, good_bytes, expected,
+                                             parts)
+            raise OSError('simulated failure during dump')
+
+        cb.version += 1
+        before = set(os.listdir(self.tmpdir))
+        with mock.patch('swift.common.ring.composite_builder.json.dump',
+                        half_dump):
+            with self.assertRaises(OSError) as cm:
+                cb.save(cb_file)
+        self.assertEqual('simulated failure during dump', str(cm.exception))
+        self.assertEqual(before, set(os.listdir(self.tmpdir)))
+        self._assert_composite_unchanged(cb_file, good_bytes, expected,
+                                         parts)
+
+    def test_save_explicit_flush_failure(self):
+        real_tempfile = tempfile.NamedTemporaryFile
+
+        def failing_flush_tempfile(*args, **kwargs):
+            return _ObservedFile(real_tempfile(*args, **kwargs), [],
+                                 flush_error=OSError('injected flush failure'))
+
+        self._check_failed_save_preserves_composite(
+            mock.patch.object(composite_builder, 'NamedTemporaryFile',
+                              failing_flush_tempfile),
+            'injected flush failure')
+
+    def test_save_fsync_failure(self):
+        self._check_failed_save_preserves_composite(
+            mock.patch('os.fsync',
+                       side_effect=OSError('injected fsync failure')),
+            'injected fsync failure')
+
+    def test_save_rename_failure(self):
+        # renamer() retries os.rename once; both attempts fail here.
+        self._check_failed_save_preserves_composite(
+            mock.patch('os.rename',
+                       side_effect=OSError('injected rename failure')),
+            'injected rename failure')
+
+    def test_save_failed_first_save_creates_no_file(self):
+        builders = self.create_sample_ringbuilders(2)
+        cb, _ = self._make_composite_builder(builders)
+        cb_file = os.path.join(self.tmpdir, 'test-composite-ring.json')
+        before = set(os.listdir(self.tmpdir))
+        with mock.patch('swift.common.ring.composite_builder.json.dump',
+                        side_effect=OSError('injected first-save failure')):
+            with self.assertRaises(OSError) as cm:
+                cb.save(cb_file)
+        self.assertEqual('injected first-save failure', str(cm.exception))
+        self.assertFalse(os.path.exists(cb_file))
+        self.assertEqual(before, set(os.listdir(self.tmpdir)))
+
+    def test_save_cleanup_failure_keeps_original_error(self):
+        cb, cb_file, good_bytes, expected = self._save_composite()
+        parts = self._composed_parts(cb_file)
+        cb.version += 1
+        before = set(os.listdir(self.tmpdir))
+        unlinked = []
+
+        def failing_unlink(path, *args, **kwargs):
+            unlinked.append(path)
+            raise OSError('injected unlink failure')
+
+        with mock.patch('os.fsync',
+                        side_effect=OSError('injected fsync failure')), \
+                mock.patch('os.unlink', failing_unlink):
+            with self.assertRaises(OSError) as cm:
+                cb.save(cb_file)
+        self.assertEqual('injected fsync failure', str(cm.exception))
+        self.assertEqual(1, len(unlinked))
+        self._assert_composite_unchanged(cb_file, good_bytes, expected,
+                                         parts)
+        # Cleanup could not run, so only that attempt's file remains.
+        self.assertEqual(before | {os.path.basename(unlinked[0])},
+                         set(os.listdir(self.tmpdir)))
+
+    def test_save_retry_after_failure(self):
+        cb, cb_file, good_bytes, expected = self._save_composite()
+        cb.version += 1
+        with mock.patch('os.rename',
+                        side_effect=OSError('injected rename failure')):
+            with self.assertRaises(OSError):
+                cb.save(cb_file)
+        before = set(os.listdir(self.tmpdir))
+        cb.save(cb_file)
+        self.assertEqual(cb.to_dict(),
+                         CompositeRingBuilder.load(cb_file).to_dict())
+        self.assertEqual(before, set(os.listdir(self.tmpdir)))
+
+    def test_save_durability_order(self):
+        cb, cb_file, good_bytes, expected = self._save_composite()
+        parts = self._composed_parts(cb_file)
+        cb.version += 1
+        new_metadata = cb.to_dict()
+        new_metadata['saved_path'] = os.path.abspath(cb_file)
+        new_metadata['serialization_version'] = 1
+        events, temp_files = [], []
+        real_tempfile = tempfile.NamedTemporaryFile
+        real_dump, real_fsync, real_rename = json.dump, os.fsync, os.rename
+
+        def observed_tempfile(*args, **kwargs):
+            handle = real_tempfile(*args, **kwargs)
+            temp_files.append(os.path.abspath(handle.name))
+            return _ObservedFile(handle, events)
+
+        def observed_dump(obj, fp, *args, **kwargs):
+            # The live composite is untouched while the new one is written.
+            self._assert_composite_unchanged(cb_file, good_bytes, expected,
+                                             parts)
+            real_dump(obj, fp, *args, **kwargs)
+            events.append('serialize')
+
+        def observed_fsync(fd):
+            is_dir = stat.S_ISDIR(os.fstat(fd).st_mode)
+            if is_dir:
+                # The rename has happened; the new file is installed.
+                with open(cb_file) as fp:
+                    self.assertEqual(new_metadata, json.load(fp))
+            else:
+                self._assert_composite_unchanged(cb_file, good_bytes,
+                                                 expected, parts)
+            real_fsync(fd)
+            events.append('directory_fsync' if is_dir else 'file_fsync')
+
+        def observed_rename(old, new):
+            # The temporary file sits beside the composite and is complete,
+            # and the old composite is still intact until the rename.
+            self.assertEqual(temp_files[-1], os.path.abspath(old))
+            self.assertEqual(os.path.abspath(cb_file), os.path.abspath(new))
+            with open(old) as fp:
+                self.assertEqual(new_metadata, json.load(fp))
+            self._assert_composite_unchanged(cb_file, good_bytes, expected,
+                                             parts)
+            real_rename(old, new)
+            events.append('rename')
+
+        with mock.patch.object(composite_builder, 'NamedTemporaryFile',
+                               observed_tempfile), \
+                mock.patch('swift.common.ring.composite_builder.json.dump',
+                           observed_dump), \
+                mock.patch('os.fsync', observed_fsync), \
+                mock.patch('os.rename', observed_rename):
+            cb.save(cb_file)
+
+        self.assertEqual(['serialize', 'flush', 'file_fsync', 'close',
+                          'rename', 'directory_fsync'], events)
+        self.assertEqual(1, len(temp_files))
+        self.assertFalse(os.path.exists(temp_files[0]))
+        with open(cb_file) as fp:
+            self.assertEqual(new_metadata, json.load(fp))
+        # The installed composite still composes the same ring.
+        self.assertEqual(parts, self._composed_parts(cb_file))
+
+    def test_save_readers_see_old_or_new_file(self):
+        # A reader loading the composite while a save runs sees the complete
+        # old file until the rename and the complete new file after it.
+        cb, cb_file, good_bytes, expected = self._save_composite()
+        old_version = cb.version
+        cb.version += 1
+        seen = []
+        real_rename = os.rename
+
+        def observed_rename(old, new):
+            seen.append(CompositeRingBuilder.load(cb_file).version)
+            real_rename(old, new)
+            seen.append(CompositeRingBuilder.load(cb_file).version)
+
+        with mock.patch('os.rename', observed_rename):
+            cb.save(cb_file)
+        self.assertEqual([old_version, old_version + 1], seen)
+
+    def test_save_after_stale_temp_file(self):
+        # A writer killed before its rename can leave a temporary file
+        # behind; it must not block or be confused with a later save.
+        cb, cb_file, good_bytes, expected = self._save_composite()
+        stale_file = cb_file + 'stale'
+        with open(stale_file, 'w') as fp:
+            fp.write('{"half-written')
+        cb.version += 1
+        cb.save(cb_file)
+        self.assertEqual(cb.to_dict(),
+                         CompositeRingBuilder.load(cb_file).to_dict())
+        with open(stale_file) as fp:
+            self.assertEqual('{"half-written', fp.read())
+
+    def test_save_to_new_path_leaves_original(self):
+        cb, cb_file, good_bytes, expected = self._save_composite()
+        parts = self._composed_parts(cb_file)
+        other_dir = os.path.join(self.tmpdir, 'elsewhere')
+        os.mkdir(other_dir)
+        other_file = os.path.join(other_dir, 'copy-composite-ring.json')
+        cb.version += 1
+        cb.save(other_file)
+        self.assertEqual(['copy-composite-ring.json'], os.listdir(other_dir))
+        self.assertEqual(cb.to_dict(),
+                         CompositeRingBuilder.load(other_file).to_dict())
+        self.check_composite_meta(other_file, cb._builder_files,
+                                  version=cb.version)
+        self._assert_composite_unchanged(cb_file, good_bytes, expected,
+                                         parts)
+
+    def test_save_repeatedly_leaves_no_temp_files(self):
+        cb, cb_file, good_bytes, expected = self._save_composite()
+        before = set(os.listdir(self.tmpdir))
+        for _ in range(10):
+            cb.version += 1
+            cb.save(cb_file)
+            self.assertEqual(cb.version,
+                             CompositeRingBuilder.load(cb_file).version)
+        self.assertEqual(before, set(os.listdir(self.tmpdir)))
+
+    def test_save_does_not_widen_file_mode(self):
+        cb, cb_file, good_bytes, expected = self._save_composite()
+        for mode in (0o600, 0o640, 0o644, 0o660, 0o664):
+            os.chmod(cb_file, mode)
+            cb.version += 1
+            cb.save(cb_file)
+            new_mode = stat.S_IMODE(os.stat(cb_file).st_mode)
+            # A save may keep or remove permissions but never add any.
+            self.assertEqual(0, new_mode & ~mode,
+                             'save widened mode %04o to %04o'
+                             % (mode, new_mode))
+
+    def test_first_save_mode_within_umask(self):
+        old_umask = os.umask(0o022)
+        self.addCleanup(os.umask, old_umask)
+        probe = os.path.join(self.tmpdir, 'probe.json')
+        with open(probe, 'w') as fp:
+            fp.write('{}')
+        plain_mode = stat.S_IMODE(os.stat(probe).st_mode)
+        builders = self.create_sample_ringbuilders(2)
+        cb, _ = self._make_composite_builder(builders)
+        cb_file = os.path.join(self.tmpdir, 'test-composite-ring.json')
+        cb.save(cb_file)
+        new_mode = stat.S_IMODE(os.stat(cb_file).st_mode)
+        # A first save may not grant more than an ordinary new file gets.
+        self.assertEqual(0, new_mode & ~plain_mode,
+                         'first save gave %04o, plain create gives %04o'
+                         % (new_mode, plain_mode))
 
     def test_rebalance(self):
         @contextmanager
