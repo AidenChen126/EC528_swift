@@ -4,8 +4,11 @@ These experiments test the **actual OpenStack Swift fork in `EC528_swift`**.
 They cover two changes to upstream Swift:
 
 - **Ring builder (experiments 0–4).** The fix changes `RingBuilder.save()` in
-  `swift/common/ring/builder.py`: it writes and syncs a temporary file before
-  replacing the existing builder, then syncs the containing directory.
+  `swift/common/ring/builder.py`: it converts the destination to an absolute
+  path, writes and syncs a `NamedTemporaryFile` beside it, and replaces the
+  existing builder with `renamer()`, which syncs the containing directory. All
+  of these steps run inside one `try` block, so a failure at any of them
+  removes the temporary file and re-raises the error.
 - **Composite ring builder (experiments 5–11).** The fix changes
   `CompositeRingBuilder.save()` in `swift/common/ring/composite_builder.py` in
   the same way. See [The composite-builder change](#the-composite-builder-change)
@@ -265,7 +268,9 @@ experiment 0's environment, checkout, dependency, run, and result sections. It
 accepts `--swift-src`, `SWIFT_SRC`, `--timeout` (600 seconds by default),
 `--results-json`, `--dry-run`, and extra pytest arguments. A collection or import
 error, such as a `TabError` in `composite_builder.py`, is reported as `77`
-rather than as a result. A passing run reports **43 tests** and
+rather than as a result. A passing run reports **58 tests** (upstream's 43 plus
+the 15 composite atomic-save unit tests described under
+[Atomic-save unit tests](#atomic-save-unit-tests-in-swifts-test-suite)) and
 `RESULT: PASS`.
 
 **Limits:** none of upstream's composite tests interrupts or fails a save, so
@@ -456,13 +461,39 @@ instance (Ubuntu, Python 3.12.3) against the patched fork, and all pass.
 | 2: process interruption | PASS, 3 of 3 |
 | 3: handled failures | PASS, 5 of 5 |
 | 4: successful-save protocol | PASS, 1 of 1 |
-| 5: composite unit suite | PASS, 43 of 43 |
+| 5: composite unit suite | PASS, 58 of 58 |
 | 6: partial serialization | PASS, 1 of 1 |
 | 7: process interruption | PASS, 4 of 4 |
 | 8: handled failures | PASS, 8 of 8 |
 | 9: successful-save protocol | PASS, 1 of 1 |
 | 10: paths, repetition, readers | PASS, 5 of 5; the reader made tens of thousands of loads across 200 saves without an error |
 | 11: file permissions | PASS, 2 of 2 |
+| Atomic-save unit tests (below) | PASS, 28 of 28; `flake8` clean |
+
+## Atomic-save unit tests in Swift's test suite
+
+The experiments' checks are also integrated into Swift's own unit suite, so they
+run with every change in Swift's CI:
+
+| File | Class | Tests |
+| --- | --- | --- |
+| `test/unit/common/ring/test_builder.py` | `TestRingBuilder` | 12 save tests: partial serialization; explicit-flush, `fsync`, rename, and failed-first-save failures; a failing cleanup; the durability order; a stale temporary file; a bare relative path; repeated saves; plus the existing `test_save` and `test_save_load`. |
+| `test/unit/common/ring/test_composite_builder.py` | `TestCompositeRingBuilder` | 15 new tests: the same failures, a retry after failure, the durability order, readers seeing the old or new file across the rename, a stale temporary file, a new path, repeated saves, and two permission checks. |
+
+```bash
+python3 -m pytest test/unit/common/ring/test_builder.py \
+    test/unit/common/ring/test_composite_builder.py -k save -v -p no:cacheprovider
+flake8 swift/common/ring/builder.py swift/common/ring/composite_builder.py \
+    test/unit/common/ring/test_builder.py test/unit/common/ring/test_composite_builder.py
+```
+
+Each test injects one failure with `mock.patch` around the real
+`NamedTemporaryFile`, `os.fsync`, and `os.rename`, then checks the exact error,
+byte-identical old contents, loading and placement, and that no temporary file
+is left. The kill and concurrent-reader experiments are represented by
+deterministic checks of the on-disk state at each step. The experiments remain
+the evidence for real process kills, real concurrent readers, and before/after
+comparisons against other checkouts.
 
 ## Source selection, output, and interpretation
 
