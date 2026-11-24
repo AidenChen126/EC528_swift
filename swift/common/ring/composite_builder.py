@@ -504,7 +504,6 @@ class CompositeRingBuilder(object):
             raise ValueError("No composed ring to save.")
         path_to_file = os.path.abspath(path_to_file)
         # persist relative paths to builder files
-        tempfile_name = None
         metadata = self.to_dict()
         # future-proofing:
         # - saving abs path to component builder files and this file should
@@ -513,8 +512,10 @@ class CompositeRingBuilder(object):
         # has been moved, so long as their relative locations are
         # unchanged.
         # - save a serialization format version number
-        metadata['saved_path'] = os.path.abspath(path_to_file)
+        metadata['saved_path'] = path_to_file
         metadata['serialization_version'] = 1
+        
+        tempfile_name = None
         try:
             with NamedTemporaryFile(
                     mode='wt',

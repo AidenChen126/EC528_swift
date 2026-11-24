@@ -1828,9 +1828,8 @@ class RingBuilder(object):
         # only place where the id is assigned. Newly created instances of this
         # class, or instances loaded from legacy builder files that have no
         # persisted id, must be saved in order for an id to be assigned.
-        id_persisted = True
-        if self._id is None:
-            id_persisted = False
+        id_persisted = self._id is not None
+        if not id_persisted:
             self._id = uuid.uuid4().hex
         builder_file = os.path.abspath(builder_file)
         temp_builder_filename = None
